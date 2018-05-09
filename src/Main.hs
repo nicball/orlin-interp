@@ -5,10 +5,6 @@ import Data.Map.Strict (Map, (!), (!?))
 import Control.Monad.State
 import Control.Monad.Except
 
-data Stat
-  = ExprS  Expr
-  | DefS   String Expr
-
 data Expr
   = NumE     Int
   | BoolE    Bool
@@ -16,10 +12,10 @@ data Expr
   | IdE      String
   | AppE     Expr Expr
   | LambdaE  String Expr
-  | BeginE   [Stat]
+  | BeginE   [Expr]
   | SetE     String Expr
   | IfE      Expr Expr Expr
-  | LetE     String Expr Expr
+  | LetE     [(String, Expr)] Expr
 
 data Value
   = NumV      Int
@@ -31,6 +27,9 @@ data Value
 
 data Builtin
   = PrintLnB
+  | NegPB
+  | ZeroPB
+  | DecB
 
 newtype Env = Env (Map String Location)
 
@@ -44,10 +43,14 @@ instance Show Value where
   show (BuiltinV b) = show b
   show UnitV = "unit"
   show (LambdaV _ _ _) = "#<lambda>"
-  show (BoolV b) = show b
+  show (BoolV True) = "true"
+  show (BoolV False) = "false"
 
 instance Show Builtin where
   show PrintLnB = "#<builtin println>"
+  show NegPB = "#<builtin neg?>"
+  show ZeroPB = "#<builtin zero?>"
+  show DecB = "#<builtin dec>"
 
 type Eval  = StateT Store (ExceptT EvalError IO)
 data EvalError = TypeError | UndefinedError String | DanglingRefError Location
@@ -103,15 +106,26 @@ evalE env (AppE f e) = do
   fv <- evalE env f
   ev <- evalE env e
   case fv of
-    BuiltinV PrintLnB -> do
-      liftIO . putStrLn . show $ ev
-      return UnitV
+    BuiltinV bi -> appBuiltin bi ev
     LambdaV id expr env_0 -> do
       loc <- allocate
       setLocation loc ev
       let env_0_1 = bind id loc env_0
       evalE env_0_1 expr
     _ -> throwEval TypeError
+  where
+    appBuiltin PrintLnB arg = do
+      liftIO . putStrLn . show $ arg
+      return UnitV
+    appBuiltin NegPB (NumV n) = do
+      return . BoolV $ n < 0
+    appBuiltin NegPB _ = throwEval TypeError
+    appBuiltin ZeroPB (NumV n) = do
+      return . BoolV $ n == 0
+    appBuiltin ZeroPB _ = throwEval TypeError
+    appBuiltin DecB (NumV n) = do
+      return . NumV $ n - 1
+    appBuiltin DecB _ = throwEval TypeError
 
 evalE env (IdE id) = do
   loc <- lookupEnv id env
@@ -120,21 +134,11 @@ evalE env (IdE id) = do
     UndefinedV -> throwEval (UndefinedError id)
     _ -> return v
 
-evalE env (BeginE exprs) = runE env UnitV exprs
+evalE env (BeginE exprs) = runE exprs
   where
-    runE :: Env -> Value -> [Stat] -> Eval Value
-    runE env retval (s : ss) =
-      case s of
-        ExprS e -> do
-          v <- evalE env e
-          runE env v ss
-        DefS id e -> do
-          loc <- allocate
-          let env' = bind id loc env
-          v <- evalE env' e
-          setLocation loc v
-          runE env' UnitV ss
-    runE env retval [] = return retval
+    runE (e : x : xs) = evalE env e >> runE (x : xs)
+    runE [e] = evalE env e
+    run [] = return UnitV
 
 evalE env (LambdaE id expr) = return (LambdaV id expr env)
 
@@ -151,54 +155,81 @@ evalE env (IfE cond then_ else_) = do
           BoolV False -> evalE env else_
           _ -> throwEval TypeError
 
-evalE env (LetE name value body) = do
-  loc <- allocate
-  let env' = bind name loc env
-  value' <- evalE env' value
-  setLocation loc value'
+evalE env (LetE bindings body) = do
+  locs <- replicateM (length bindings) allocate
+  let env' = foldr (uncurry bind) env (zip (map fst bindings) locs)
+  values <- mapM (evalE env' . snd) bindings
+  mapM_ (uncurry setLocation) (zip locs values)
   evalE env' body
 
 mtEnv :: Env
 mtEnv = Env $
   Map.fromList  [ ("println", Location 0)
+                , ("zero?", Location 1)
+                , ("dec", Location 2)
                 ]
 
 mtStore :: Store
-mtStore = Store
-  (Map.fromList [ (Location 0, BuiltinV PrintLnB)
-                ])
+mtStore = Store $
+  Map.fromList [ (Location 0, BuiltinV PrintLnB)
+               , (Location 1, BuiltinV ZeroPB)
+               , (Location 2, BuiltinV DecB)
+               ]
 
 main :: IO ()
 main = do
-  let prog = LetE "v" (NumE 5)
-        (BeginE [ DefS "i" (IdE "v")
-                , DefS "f" (LambdaE "x" (AppE (IdE "println") (IdE "i")))
-                , ExprS (AppE (IdE "f") UnitE)
-                , ExprS (SetE "i" (NumE 6))
-                , ExprS (AppE (IdE "f") UnitE)
-                , DefS "i" (NumE 7)
-                , ExprS (AppE (IdE "f") UnitE)
-                , ExprS (IfE (BoolE True)
-                             (AppE (IdE "println") (NumE 1))
-                             (AppE (IdE "println") (NumE 0)))
-                , DefS "fine" (LambdaE "x" (AppE (IdE "fine") (IdE "x")))
-                , DefS "notfine" (IdE "notfine")
-                ])
-  -- let v = 5 {
-  --   var i = v
-  --   var f = x => println i
+  let oddP =
+        LambdaE "x"
+        (IfE (AppE (IdE "zero?") (IdE "x"))
+          (BoolE False)
+          (AppE (IdE "even?") (AppE (IdE "dec") (IdE "x"))))
+  let evenP =
+        LambdaE "x"
+        (IfE (AppE (IdE "zero?") (IdE "x"))
+          (BoolE True)
+          (AppE (IdE "odd?") (AppE (IdE "dec") (IdE "x"))))
+  let prog =
+        LetE
+        [ ("i", (NumE 5))
+        , ("odd?", oddP)
+        , ("even?", evenP)
+        , ("f", (LambdaE "x" (AppE (IdE "println") (IdE "i"))))
+        ]
+        (BeginE
+          [ AppE (IdE "println") (AppE (IdE "odd?") (NumE 3))
+          , AppE (IdE "f") UnitE
+          , SetE "i" (NumE 6)
+          , AppE (IdE "f") UnitE
+          , LetE [("i", NumE 7)]
+              (AppE (IdE "f") UnitE)
+          , LetE
+              [ ("fine", LambdaE "x" (AppE (IdE "fine") (IdE "x")))
+              , ("notfine", AppE (IdE "dec") (IdE "notfine"))
+              ]
+              UnitE
+          ])
+  -- let i = 5
+  --     odd? = x =>
+  --       if zero?(x)
+  --       then false
+  --       else even?(dec(x))
+  --     even? = x =>
+  --       if zero?(x)
+  --       then true
+  --       else odd?(dec(x))
+  --     f = x => println i
+  -- {
+  --   println(odd?(3))
   --   f()      ;; print 5
   --   i = 6
   --   f()      ;; print 6
-  --   var i = 7
-  --   f()      ;; print 6
-  --   if true
-  --   then print 1
-  --   else print 0 ;; print 1
-  --   var fine = x => fine(x)
-  --   var notfine = notfine      ;; error
+  --   let i = 7
+  --     f()      ;; print 6
+  --   let fine = x => fine(x)
+  --       notfine = dec(notfine)      ;; error
+  --   ()
   -- }
-  result <- eval mtEnv mtStore (BeginE [ExprS prog])
+  result <- eval mtEnv mtStore prog
   case result of
     Left err -> putStrLn ("error: " ++ show err)
     Right (v, _) -> putStrLn ("=> " ++ show v)
