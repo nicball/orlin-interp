@@ -31,6 +31,9 @@ data Builtin
   | ZeroPB
   | DecB
 
+allBuiltins :: [Builtin]
+allBuiltins = [PrintLnB, NegPB, ZeroPB, DecB]
+
 newtype Env = Env (Map String Location)
 
 newtype Store = Store (Map Location Value)
@@ -40,17 +43,17 @@ newtype Location = Location Int
 
 instance Show Value where
   show (NumV n) = show n
-  show (BuiltinV b) = show b
+  show (BuiltinV b) = "#<builtin " ++ show b ++ ">"
   show UnitV = "unit"
   show (LambdaV _ _ _) = "#<lambda>"
   show (BoolV True) = "true"
   show (BoolV False) = "false"
 
 instance Show Builtin where
-  show PrintLnB = "#<builtin println>"
-  show NegPB = "#<builtin neg?>"
-  show ZeroPB = "#<builtin zero?>"
-  show DecB = "#<builtin dec>"
+  show PrintLnB = "println"
+  show NegPB = "neg?"
+  show ZeroPB = "zero?"
+  show DecB = "dec"
 
 type Eval  = StateT Store (ExceptT EvalError IO)
 data EvalError = TypeError | UndefinedError String | DanglingRefError Location
@@ -158,26 +161,21 @@ evalE env (IfE cond then_ else_) = do
 evalE env (LetE bindings body) = do
   locs <- replicateM (length bindings) allocate
   let env' = foldr (uncurry bind) env (zip (map fst bindings) locs)
-  values <- mapM (evalE env' . snd) bindings
-  mapM_ (uncurry setLocation) (zip locs values)
+  forM_ (zip bindings locs) $ \((_, valE), loc) -> do
+    value <- evalE env' valE
+    setLocation loc value
   evalE env' body
 
-mtEnv :: Env
-mtEnv = Env $
-  Map.fromList  [ ("println", Location 0)
-                , ("zero?", Location 1)
-                , ("dec", Location 2)
-                ]
-
-mtStore :: Store
-mtStore = Store $
-  Map.fromList [ (Location 0, BuiltinV PrintLnB)
-               , (Location 1, BuiltinV ZeroPB)
-               , (Location 2, BuiltinV DecB)
-               ]
+mtEnvStore :: (Env, Store)
+mtEnvStore =
+  let bs = zip allBuiltins [0 ..]
+      env = map (\(b, i) -> (show b, Location i)) bs
+      store = map (\(b, i) -> (Location i, BuiltinV b)) bs
+  in (Env (Map.fromList env), Store (Map.fromList store))
 
 main :: IO ()
 main = do
+  let (mtEnv, mtStore) = mtEnvStore
   let oddP =
         LambdaE "x"
         (IfE (AppE (IdE "zero?") (IdE "x"))
@@ -204,6 +202,7 @@ main = do
               (AppE (IdE "f") UnitE)
           , LetE
               [ ("fine", LambdaE "x" (AppE (IdE "fine") (IdE "x")))
+              , ("alsofine", (IdE "fine"))
               , ("notfine", AppE (IdE "dec") (IdE "notfine"))
               ]
               UnitE
@@ -226,6 +225,7 @@ main = do
   --   let i = 7
   --     f()      ;; print 6
   --   let fine = x => fine(x)
+  --       alsofine = fine
   --       notfine = dec(notfine)      ;; error
   --   ()
   -- }
